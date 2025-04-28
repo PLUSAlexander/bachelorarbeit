@@ -1,0 +1,217 @@
+package main
+
+import (
+	"encoding/csv"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"golang.org/x/net/html"
+)
+
+// void used for deduplication
+type void struct{}
+
+// getVQD retrieves the DuckDuckGo vqd token required for HTML search
+func getVQD(query string) (string, error) {
+	initURL := fmt.Sprintf("https://duckduckgo.com/?q=%s", url.QueryEscape(query))
+	req, err := http.NewRequest("GET", initURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	body := string(bodyBytes)
+
+	// match both vqd='...' and vqd="..."
+	re := regexp.MustCompile(`vqd=['"](\d+-[0-9a-f]+)['"]`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return "", fmt.Errorf("vqd token not found")
+	}
+	return m[1], nil
+}
+
+// searchDuckDuckGoHTML queries DuckDuckGo's HTML interface with vqd token and returns result links
+func searchDuckDuckGoHTML(query string) ([]string, error) {
+	fmt.Fprintf(os.Stderr, "[DEBUG] searchDuckDuckGoHTML called with query: %s\n", query)
+
+	vqd, err := getVQD(query)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] getVQD error: %v\n", err)
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "[DEBUG] Using vqd=%s for query %s\n", vqd, query)
+
+	base := "https://duckduckgo.com/html/"
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("vqd", vqd)
+	params.Set("kl", "us-en")
+	searchURL := fmt.Sprintf("%s?%s", base, params.Encode())
+	fmt.Fprintf(os.Stderr, "[DEBUG] Search URL: %s\n", searchURL)
+
+	req, err := http.NewRequest("GET", searchURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Connection", "keep-alive")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	var resp *http.Response
+	// Retry on non-200
+	for attempt := 1; attempt <= 5; attempt++ {
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+		resp.Body.Close()
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+	fmt.Fprintf(os.Stderr, "[DEBUG] HTTP status: %s\n", resp.Status)
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var links []string
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			var href, classAttr string
+			for _, a := range n.Attr {
+				if a.Key == "class" {
+					classAttr = a.Val
+				} else if a.Key == "href" {
+					href = a.Val
+				}
+			}
+			if strings.Contains(classAttr, "result__a") && href != "" {
+				raw := href
+				if strings.HasPrefix(raw, "//") {
+					raw = "https:" + raw
+				}
+				u, err := url.QueryUnescape(raw)
+				if err != nil {
+					u = raw
+				}
+				if strings.HasPrefix(u, "/l/?") {
+					parts, _ := url.ParseQuery(strings.TrimPrefix(u, "/l/?"))
+					if real, ok := parts["uddg"]; ok && len(real) > 0 {
+						u = real[0]
+					}
+				}
+				links = append(links, u)
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+
+	// Deduplicate
+	seen := make(map[string]void)
+	var unique []string
+	for _, l := range links {
+		if _, ok := seen[l]; !ok {
+			seen[l] = void{}
+			unique = append(unique, l)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[DEBUG] %d links found for %s\n", len(unique), query)
+	return unique, nil
+}
+
+func main() {
+	csvPath := flag.String("input", "list_of_names_and_affiliations.csv", "CSV file path")
+	flag.Parse()
+
+	inFile, err := os.Open(*csvPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] Opening CSV: %v\n", err)
+		os.Exit(1)
+	}
+	defer inFile.Close()
+
+	reader := csv.NewReader(inFile)
+	reader.FieldsPerRecord = -1
+	records, err := reader.ReadAll()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] Reading CSV: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Map person -> links
+	results := make(map[string][]string)
+
+	for i, record := range records {
+		if len(record) == 0 || strings.TrimSpace(record[0]) == "" {
+			continue
+		}
+		if i == 0 {
+			hdr := strings.ToLower(strings.Join(record, ","))
+			if strings.Contains(hdr, "name") && strings.Contains(hdr, "institution") {
+				continue
+			}
+		}
+		name := strings.TrimSpace(record[0])
+		inst := ""
+		if len(record) > 1 {
+			inst = strings.TrimSpace(record[1])
+		}
+		query := name
+		if inst != "" {
+			query += " " + inst
+		}
+
+		fmt.Fprintf(os.Stderr, "[DEBUG] Searching for: %s\n", query)
+		links, err := searchDuckDuckGoHTML(query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] search error for %s: %v\n", query, err)
+			continue
+		}
+
+		// store
+		results[name] = links
+
+		// debugprint
+		fmt.Fprintf(os.Stderr, "[DEBUG] Links for %s:\n", name)
+		if len(links) == 0 {
+			fmt.Fprintf(os.Stderr, "[DEBUG]   (no results)\n")
+		} else {
+			for _, l := range links {
+				fmt.Fprintf(os.Stderr, "[DEBUG]   %s\n", l)
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[DEBUG] Collected results for %d researchers\n", len(results))
+}

@@ -1,0 +1,121 @@
+package main
+
+import (
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// levenshteinDistance berechnet die minimale Bearbeitungsdistanz zwischen a und b.
+func levenshteinDistance(a, b string) int {
+	la, lb := len(a), len(b)
+	dp := make([][]int, la+1)
+	for i := range dp {
+		dp[i] = make([]int, lb+1)
+		dp[i][0] = i
+	}
+	for j := 1; j <= lb; j++ {
+		dp[0][j] = j
+	}
+	for i := 1; i <= la; i++ {
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			dp[i][j] = min(
+				dp[i-1][j]+1,      // Löschung
+				dp[i][j-1]+1,      // Einfügung
+				dp[i-1][j-1]+cost, // Ersetzung
+			)
+		}
+	}
+	return dp[la][lb]
+}
+
+func min(a, b, c int) int {
+	m := a
+	if b < m {
+		m = b
+	}
+	if c < m {
+		m = c
+	}
+	return m
+}
+
+func main() {
+	urls := []string{
+		"https://engineering.uci.edu/users/mohammad-al-faruque",
+		"https://www.cecs.uci.edu/people/mohammad-a-al-faruque-3/",
+		"https://its.uci.edu/people/mohammad-al-faruque/",
+		"https://aicps.eng.uci.edu/",
+		"https://aicps.eng.uci.edu/people-2/",
+		"https://www.linkedin.com/in/alfaruque",
+		"https://scholar.google.com/citations?user=ejWHC-cAAAAJ&hl=en",
+		"https://pdcs.engr.ucr.edu/people/mohammad-faruque",
+		"https://ucits.org/people/mohammad-abdullah-al-faruque/",
+		"https://www.researchgate.net/profile/Mohammad-Abdullah-Al-Faruque",
+	}
+
+	emailRegex := regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
+	found := make(map[string]struct{})
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	for _, url := range urls {
+		resp, err := client.Get(url)
+		if err != nil {
+			fmt.Printf("Fehler beim Abrufen von %s: %v\n", url, err)
+			continue
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("Fehler beim Lesen von %s: %v\n", url, err)
+			continue
+		}
+		for _, email := range emailRegex.FindAllString(string(body), -1) {
+			found[email] = struct{}{}
+		}
+	}
+
+	if len(found) == 0 {
+		fmt.Println("Keine E-Mail-Adresse gefunden.")
+		return
+	}
+
+	// Normalisiere den Forscher-Namen ("Mohammad Al Faruque")
+	rawName := "Mohammad Al Faruque"
+	normName := normalize(rawName)
+
+	// Finde die Adresse(n) mit minimaler Levenshtein-Distanz
+	bestDist := -1
+	bestEmails := []string{}
+	for email := range found {
+		prefix := strings.Split(email, "@")[0]
+		normPrefix := normalize(prefix)
+		dist := levenshteinDistance(normName, normPrefix)
+		if bestDist < 0 || dist < bestDist {
+			bestDist = dist
+			bestEmails = []string{email}
+		} else if dist == bestDist {
+			bestEmails = append(bestEmails, email)
+		}
+	}
+
+	fmt.Println("Vermutlich korrekte E-Mail-Adresse(n):")
+	for _, e := range bestEmails {
+		fmt.Printf(" - %s  (Distanz=%d)\n", e, bestDist)
+	}
+}
+
+// normalize entfernt alle Nicht‑Alphanumerischen Zeichen und wandelt in Kleinbuchstaben um.
+func normalize(s string) string {
+	s = strings.ToLower(s)
+	// alles außer a–z und 0–9 entfernen
+	re := regexp.MustCompile(`[^a-z0-9]`)
+	return re.ReplaceAllString(s, "")
+}
