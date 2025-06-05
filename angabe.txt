@@ -1,0 +1,47 @@
+Ich fasse nochmals den Vorschlag für Ihr potentielles Bachelorprojekt (Basis für die Bachelorarbeit) zusmmen:
+
+ 
+
+– gegeben: eine Liste von Namen + Institution als CSV-File (ein Beispiel ist im Anhang)
+
+ 
+
+zu implementieren:
+
+(1) konventionelle Verarbeitung: es wird das DuckDuckGo-API für die Suchabfrage verwendet (Suche jeweils nach Name+Institution) => die Links werden aus der Abfrage gesucht; pro Link: Suche nach einer E-Mail-Adresse, die möglichst dem Namen entspricht
+
+Output: ein CSV-File mit einer Spalte Namen + Institution und einer Spalte E-Mail-Adresse
+
+ 
+
+(2) Verarbeitung mit GPT4-mini oder GPT4-Turbo: es wird das DuckDuckGo-API für die Suchabfrage verwendet (Suche jeweils nach Name+Institution) => die Links werden aus der Abfrage mit GPT4 gesucht; pro Link: GPT4-Suche nach einer E-Mail-Adresse, die möglichst dem Namen entspricht
+
+Output: ein CSV-File mit einer Spalte Namen + Institution und einer Spalte E-Mail-Adresse
+
+ 
+
+(3) Verarbeitung mit DeepSeek (falls auf unserem Server installierbar – das klären wir noch intern ab) oder Llama (das kann auf alle Fälle auf unserem Server installiert werden): es wird das DuckDuckGo-API für die Suchabfrage verwendet (Suche jeweils nach Name+Institution) => die Links werden aus der Abfrage mit DeepSeek/Llama gesucht; pro Link: DeepSeek/Llama-Suche nach einer E-Mail-Adresse, die möglichst dem Namen entspricht
+
+Output: ein CSV-File mit einer Spalte Namen + Institution und einer Spalte E-Mail-Adresse
+
+ 
+
+Vergleich der Qualität der Ergebnisse
+
+Vergleich der Implementierungen: # Lines of Code, was konnte generiert werden, was nicht; Code-Komplexität
+
+Vergleich der Kosten für die LLM-Verwendung bei (2) und (3)
+
+ 
+
+Ich würde es bevorzugen, dass Sie alle 3 Varianten in Go implementieren, auch weil Sie Go nicht kennen und es interessant ist, wieviel Aufwand die Einarbeitung bedeutet, wenn man GPT/Copilot für das Code-Generieren verwendet
+
+ 
+
+Bitte geben Sie mir Bescheid, ob Sie die oben skizzierte Bachelorarbeit durchführen wollen?
+
+ 
+
+Mit freundlichen Grüßen,
+
+-- Wolfgang Pree

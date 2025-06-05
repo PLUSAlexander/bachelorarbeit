@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -21,28 +22,47 @@ import (
 // void used for deduplication
 type void struct{}
 
-// Erzeuge einen Client mit CookieJar und Timeout
+// List of User-Agent strings for rotation
+var defaultUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+	"Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/115.0",
+}
+
+// newClient creates an HTTP client with a cookie jar and timeout.
 func newClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{
 		Jar:     jar,
-		Timeout: 15 * time.Second,
+		Timeout: 20 * time.Second,
 	}
 }
 
-// getVQD holt das vqd-Token
+// randomUserAgent picks a random User-Agent.
+func randomUserAgent() string {
+	return defaultUserAgents[rand.Intn(len(defaultUserAgents))]
+}
+
+// getVQD fetches the DuckDuckGo token needed for search.
 func getVQD(client *http.Client, query string) (string, error) {
-	initURL := fmt.Sprintf("https://duckduckgo.com/?q=%s", url.QueryEscape(query))
-	req, _ := http.NewRequest("GET", initURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	url := fmt.Sprintf("https://duckduckgo.com/?q=%s", url.QueryEscape(query))
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", randomUserAgent())
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
 	re := regexp.MustCompile(`vqd=['"](\d+-[0-9a-f]+)['"]`)
 	m := re.FindStringSubmatch(string(body))
 	if len(m) < 2 {
@@ -51,95 +71,103 @@ func getVQD(client *http.Client, query string) (string, error) {
 	return m[1], nil
 }
 
-// searchDuckDuckGoHTML führt die HTML-Suche durch mit Retry-Logik
+// searchDuckDuckGoHTML performs a DuckDuckGo search and returns result URLs.
 func searchDuckDuckGoHTML(client *http.Client, query string) ([]string, error) {
-	// Hol dir das erste vqd
-	vqd, err := getVQD(client, query)
-	if err != nil {
-		return nil, err
-	}
-
 	base := "https://duckduckgo.com/html/"
-	params := url.Values{}
-	params.Set("q", query)
-	params.Set("vqd", vqd)
-	params.Set("kl", "us-en")
 
 	var resp *http.Response
-	// bis zu 3 Versuche
-	for attempt := 1; attempt <= 3; attempt++ {
-		searchURL := fmt.Sprintf("%s?%s", base, params.Encode())
-		req, _ := http.NewRequest("GET", searchURL, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	// Retry with backoff
+	for attempt := 1; attempt <= 8; attempt++ {
+		vqd, err := getVQD(client, query)
+		if err != nil {
+			return nil, err
+		}
+
+		params := url.Values{}
+		params.Set("q", query)
+		params.Set("vqd", vqd)
+		params.Set("kl", "us-en")
+		searchURL := base + "?" + params.Encode()
+
+		req, err := http.NewRequest("GET", searchURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", randomUserAgent())
 		req.Header.Set("Accept", "text/html,application/xhtml+xml")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-		// Referer kann helfen
 		req.Header.Set("Referer", "https://duckduckgo.com/")
 
 		resp, err = client.Do(req)
 		if err != nil {
 			return nil, err
 		}
-		// prüfen, ob 200 OK
+
 		if resp.StatusCode == http.StatusOK {
 			break
 		}
-		// wenn nicht, 2 Sekunden warten und neues vqd holen
+
 		resp.Body.Close()
-		time.Sleep(2 * time.Second)
-		vqd, _ = getVQD(client, query)
-		params.Set("vqd", vqd)
+		// exponential backoff + jitter
+		delay := time.Duration(attempt*700)*time.Millisecond + time.Duration(rand.Intn(700))*time.Millisecond
+		if resp.StatusCode == http.StatusAccepted {
+			delay += 3 * time.Second
+		}
+		time.Sleep(delay)
+		if attempt%4 == 0 {
+			client = newClient()
+		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("nach 3 Versuchen immer noch Status %d", resp.StatusCode)
+		return nil, fmt.Errorf("failed after retries: status %d", resp.StatusCode)
 	}
 
-	// HTML parsen wie gehabt …
+	// parse HTML
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	var links []string
-	var f func(*html.Node)
-	f = func(n *html.Node) {
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.Data == "a" {
-			var href, classAttr string
+			var href, cls string
 			for _, a := range n.Attr {
 				if a.Key == "class" {
-					classAttr = a.Val
+					cls = a.Val
 				} else if a.Key == "href" {
 					href = a.Val
 				}
 			}
-			if strings.Contains(classAttr, "result__a") && href != "" {
-				raw := href
-				if strings.HasPrefix(raw, "//") {
-					raw = "https:" + raw
+			if strings.Contains(cls, "result__a") && href != "" {
+				link := href
+				if strings.HasPrefix(link, "//") {
+					link = "https:" + link
 				}
-				u, err := url.QueryUnescape(raw)
-				if err != nil {
-					u = raw
+				u, err := url.QueryUnescape(link)
+				if err == nil {
+					link = u
 				}
-				if strings.HasPrefix(u, "/l/?") {
-					parts, _ := url.ParseQuery(strings.TrimPrefix(u, "/l/?"))
-					if real, ok := parts["uddg"]; ok && len(real) > 0 {
-						u = real[0]
+				if strings.HasPrefix(link, "/l/?") {
+					q, _ := url.ParseQuery(strings.TrimPrefix(link, "/l/?"))
+					if real, ok := q["uddg"]; ok && len(real) > 0 {
+						link = real[0]
 					}
 				}
-				links = append(links, u)
+				links = append(links, link)
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
+			walk(c)
 		}
 	}
-	f(doc)
+	walk(doc)
 
-	// Dedup
-	seen := make(map[string]void)
+	// dedupe
+	seen := map[string]void{}
 	var unique []string
 	for _, l := range links {
 		if _, ok := seen[l]; !ok {
@@ -151,76 +179,78 @@ func searchDuckDuckGoHTML(client *http.Client, query string) ([]string, error) {
 }
 
 func main() {
-	csvPath := flag.String("input", "list_of_names_and_affiliations.csv", "CSV file path")
-	outPath := flag.String("output", "links_output.txt", "Output file path")
+	rand.Seed(time.Now().UnixNano())
+
+	inPath := flag.String("input", "list_of_names_and_affiliations.csv", "CSV input path")
+	outPath := flag.String("output", "links_output.txt", "Output path")
 	flag.Parse()
 
-	inFile, err := os.Open(*csvPath)
+	inFile, err := os.Open(*inPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] Opening CSV: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error opening input: %v\n", err)
 		os.Exit(1)
 	}
 	defer inFile.Close()
 
+	rdr := csv.NewReader(inFile)
+	rdr.FieldsPerRecord = -1
+	recs, err := rdr.ReadAll()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading CSV: %v\n", err)
+		os.Exit(1)
+	}
+
 	os.MkdirAll(filepath.Dir(*outPath), 0755)
 	outFile, err := os.Create(*outPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] Creating output: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating output: %v\n", err)
 		os.Exit(1)
 	}
 	defer outFile.Close()
-	writer := bufio.NewWriter(outFile)
+	w := bufio.NewWriter(outFile)
 
-	reader := csv.NewReader(inFile)
-	reader.FieldsPerRecord = -1
-	records, err := reader.ReadAll()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] Reading CSV: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Ein einziger Client für alle
 	client := newClient()
 
-	for i, record := range records {
-		if len(record) == 0 || strings.TrimSpace(record[0]) == "" {
+	for i, row := range recs {
+		if len(row) == 0 || strings.TrimSpace(row[0]) == "" {
 			continue
 		}
 		if i == 0 {
-			low := strings.ToLower(strings.Join(record, ","))
+			low := strings.ToLower(strings.Join(row, ","))
 			if strings.Contains(low, "name") && strings.Contains(low, "institution") {
 				continue
 			}
 		}
 
-		name := strings.TrimSpace(record[0])
-		inst := ""
-		if len(record) > 1 {
-			inst = strings.TrimSpace(record[1])
-		}
-		query := name
-		if inst != "" {
-			query += " " + inst
+		if i > 0 && i%5 == 0 {
+			client = newClient()
 		}
 
-		fmt.Fprintf(os.Stderr, "[DEBUG] Searching for: %s\n", query)
+		query := strings.TrimSpace(row[0])
+		if len(row) > 1 && strings.TrimSpace(row[1]) != "" {
+			query += " " + strings.TrimSpace(row[1])
+		}
+
+		fmt.Fprintf(os.Stderr, "Searching for: %s\n", query)
 		links, err := searchDuckDuckGoHTML(client, query)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] search error for %s: %v\n", query, err)
+			fmt.Fprintf(os.Stderr, "Error for %s: %v\n", query, err)
 			continue
 		}
 
-		writer.WriteString(name + ":\n")
+		w.WriteString(query + ":\n")
 		if len(links) == 0 {
-			writer.WriteString("(no results)\n")
+			w.WriteString("(no results)\n")
 		} else {
 			for _, l := range links {
-				writer.WriteString(l + "\n")
+				w.WriteString(l + "\n")
 			}
 		}
-		writer.WriteString("\n")
+		w.WriteString("\n")
+
+		time.Sleep(time.Duration(700+rand.Intn(800)) * time.Millisecond)
 	}
 
-	writer.Flush()
-	fmt.Fprintf(os.Stderr, "[DEBUG] Output written\n")
+	w.Flush()
+	fmt.Fprintln(os.Stderr, "Output written.")
 }

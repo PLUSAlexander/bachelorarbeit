@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,41 +40,51 @@ func main() {
 
 	writer := csv.NewWriter(csvFile)
 	defer writer.Flush()
-
-	// Kopfzeile schreiben
 	writer.Write([]string{"Name und Institution", "E-Mail"})
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	emailRegex := regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 
 	for _, rec := range records {
-		// Spalte A: Name und Institution
 		nameInst := rec.Name
 
-		// E-Mails sammeln
+		// paralleles Abrufen und Parsen der URLs
 		found := make(map[string]struct{})
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 5) // max 5 gleichzeitig
+
 		for _, rawURL := range rec.URLs {
-			targetURL := extractTargetURL(rawURL)
-			if strings.Contains(targetURL, "linkedin.com") {
+			urlStr := extractTargetURL(rawURL)
+			if strings.Contains(urlStr, "linkedin.com") {
 				continue
 			}
 
-			body, err := fetchURL(client, targetURL)
-			if err != nil {
-				continue
-			}
-			for _, e := range emailRegex.FindAllString(string(body), -1) {
-				found[e] = struct{}{}
-			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(u string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				body, err := fetchURL(client, u)
+				if err != nil {
+					return
+				}
+				for _, e := range emailRegex.FindAllString(string(body), -1) {
+					mu.Lock()
+					found[e] = struct{}{}
+					mu.Unlock()
+				}
+			}(urlStr)
 		}
+		wg.Wait()
 
-		// Bestimme beste E-Mail oder leer
+		// beste E‑Mail ermitteln
 		email := ""
 		if len(found) > 0 {
 			email = selectBestEmail(rec.Name, found)
 		}
 
-		// Schreibe Datenzeile: A=Name und Institution, B=E-Mail
 		writer.Write([]string{nameInst, email})
 	}
 
@@ -91,20 +102,18 @@ func parseInput(path string) ([]Record, error) {
 	var records []Record
 	scanner := bufio.NewScanner(f)
 	var current *Record
-
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		if strings.HasSuffix(line, ":") {
-			// Name und Institution, ohne ':'
 			name := strings.TrimSuffix(line, ":")
-			current = &Record{Name: name}
-			records = append(records, *current)
+			r := Record{Name: name}
+			records = append(records, r)
+			current = &records[len(records)-1]
 		} else if current != nil {
 			current.URLs = append(current.URLs, line)
-			records[len(records)-1] = *current
 		}
 	}
 	return records, scanner.Err()
@@ -138,11 +147,10 @@ func selectBestEmail(name string, found map[string]struct{}) string {
 	bestDist := -1
 	bestEmail := ""
 	normName := normalize(name)
-
 	for email := range found {
-		dist := levenshteinDistance(normName, normalize(strings.Split(email, "@")[0]))
-		if bestDist < 0 || dist < bestDist {
-			bestDist = dist
+		d := levenshteinDistance(normName, normalize(strings.Split(email, "@")[0]))
+		if bestDist < 0 || d < bestDist {
+			bestDist = d
 			bestEmail = email
 		}
 	}
