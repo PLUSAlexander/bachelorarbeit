@@ -1,131 +1,199 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	"golang.org/x/net/html"
 )
 
-func main() {
-	// Flags for input/output
-	inputPath := flag.String("input", "links.csv", "Path to input CSV file (first column: Name+Institution, subsequent columns: URLs)")
-	outputPath := flag.String("output", "emails.csv", "Path to output CSV file")
-	flag.Parse()
+type Entry struct {
+	Identifier string
+	Links      []string
+}
 
-	// OpenAI API key
+type Result struct {
+	Identifier string
+	Email      string
+}
+
+func main() {
+	inputPath := "links_output.txt"
+	outputPath := "emails.csv"
+
+	// API-Key abfragen
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is required")
+		fmt.Print("Bitte OPENAI_API_KEY eingeben: ")
+		reader := bufio.NewReader(os.Stdin)
+		entered, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatal("Fehler beim Einlesen des API Key: ", err)
+		}
+		apiKey = strings.TrimSpace(entered)
+		if apiKey == "" {
+			log.Fatal("Kein API Key eingegeben. Abbruch.")
+		}
 	}
 	client := openai.NewClient(apiKey)
 
-	// Read input CSV
-	inFile, err := os.Open(*inputPath)
+	entries, err := loadEntries(inputPath)
 	if err != nil {
-		log.Fatalf("Error opening input file: %v", err)
-	}
-	defer inFile.Close()
-
-	r := csv.NewReader(inFile)
-	allRows, err := r.ReadAll()
-	if err != nil {
-		log.Fatalf("Error reading CSV: %v", err)
+		log.Fatal(err)
 	}
 
-	// Prepare output CSV
-	outFile, err := os.Create(*outputPath)
+	outFile, err := os.Create(outputPath)
 	if err != nil {
-		log.Fatalf("Error creating output file: %v", err)
+		log.Fatalf("Fehler beim Erstellen der CSV: %v", err)
 	}
 	defer outFile.Close()
-	w := csv.NewWriter(outFile)
-	defer w.Flush()
+	writer := csv.NewWriter(outFile)
+	defer writer.Flush()
+	writer.Write([]string{"Name+Institution", "Email"})
 
-	// Write header
-	if err := w.Write([]string{"Name+Institution", "Email"}); err != nil {
-		log.Fatalf("Error writing header: %v", err)
-	}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	emailRx := regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
 
-	// Process rows
-	for i, row := range allRows {
-		if i == 0 {
-			continue
-		}
-		identifier := row[0]
-		urls := row[1:]
-		email := findEmailForPerson(context.Background(), client, identifier, urls)
-		if err := w.Write([]string{identifier, email}); err != nil {
-			log.Printf("Error writing record for %s: %v", identifier, err)
-		}
-		fmt.Printf("%s -> %s\n", identifier, email)
+	for _, ent := range entries {
+		email := findEmailForPerson(context.Background(), client, httpClient, ent, emailRx)
+		writer.Write([]string{ent.Identifier, email})
+		fmt.Printf("%s -> %s\n", ent.Identifier, email)
 	}
 }
 
-// findEmailForPerson uses GPT-4-mini to extract the email from page text
-func findEmailForPerson(ctx context.Context, client *openai.Client, identifier string, urls []string) string {
-	emailRegex := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
-	model := "o4-mini"
+func loadEntries(path string) ([]Entry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
 
-	for _, url := range urls {
-		text := fetchPageText(url)
+	scanner := bufio.NewScanner(file)
+	var entries []Entry
+	var cur Entry
+	for scanner.Scan() {
+		l := strings.TrimSpace(scanner.Text())
+		if l == "" {
+			continue
+		}
+		if strings.HasSuffix(l, ":") {
+			if cur.Identifier != "" {
+				entries = append(entries, cur)
+			}
+			cur = Entry{Identifier: strings.TrimSuffix(l, ":"), Links: nil}
+		} else {
+			cur.Links = append(cur.Links, l)
+		}
+	}
+	if cur.Identifier != "" {
+		entries = append(entries, cur)
+	}
+	return entries, scanner.Err()
+}
+
+func findEmailForPerson(ctx context.Context, client *openai.Client, httpClient *http.Client, ent Entry, emailRx *regexp.Regexp) string {
+	model := "gpt-4-turbo"
+	urls := ent.Links
+	if len(urls) == 0 {
+		urls = searchDuckDuckGo(ent.Identifier+" E-Mail", httpClient)
+	}
+	for _, raw := range urls {
+		link := raw
+		if strings.Contains(link, "uddg=") {
+			if u, err := url.Parse(link); err == nil {
+				if q := u.Query().Get("uddg"); q != "" {
+					if d, err2 := url.QueryUnescape(q); err2 == nil {
+						link = d
+					}
+				}
+			}
+		}
+		text := fetchPageText(link, httpClient)
 		if text == "" {
 			continue
 		}
-		// Truncate to 2000 chars
 		snippet := text
-		if len(snippet) > 2000 {
-			snippet = snippet[:2000]
+		if len(snippet) > 4000 {
+			snippet = snippet[:4000]
 		}
+		prompt := fmt.Sprintf(
+			`Beispiel:
+Text: "Kontakt: max.mustermann@example.com" -> max.mustermann@example.com
 
-		// Build prompt
-		prompt := fmt.Sprintf("Hier ist ein Ausschnitt der Seite %s:\n%s\n\nFinde die wahrscheinlichste E-Mail-Adresse der Person '%s'. Wenn keine gefunden wird, antworte nur mit 'Keine gefunden'.", url, snippet, identifier)
+Seite: %s
+%s
 
-		// Call GPT-4-mini
+Gib nur die E-Mail-Adresse für '%s'. Oder 'Keine gefunden'.`,
+			link, snippet, ent.Identifier,
+		)
 		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model:       model,
-			Messages:    []openai.ChatCompletionMessage{{Role: "user", Content: prompt}},
-			MaxTokens:   50,
-			Temperature: 0,
+			Model:               model,
+			Messages:            []openai.ChatCompletionMessage{{Role: "user", Content: prompt}},
+			Temperature:         0.3,
+			TopP:                0.9,
+			MaxCompletionTokens: 60,
 		})
 		if err != nil {
-			log.Printf("API error for %s: %v", url, err)
+			log.Printf("OpenAI-Fehler für %s: %v", link, err)
 			continue
 		}
-		answer := strings.TrimSpace(resp.Choices[0].Message.Content)
-
-		// Check for email pattern
-		if emailRegex.MatchString(answer) {
-			return emailRegex.FindString(answer)
-		}
-		if strings.EqualFold(answer, "Keine gefunden") {
-			continue
-		}
-		// Fallback: first found email
-		if m := emailRegex.FindString(answer); m != "" {
+		ans := strings.TrimSpace(resp.Choices[0].Message.Content)
+		if m := emailRx.FindString(ans); m != "" {
 			return m
 		}
 	}
 	return ""
 }
 
-// fetchPageText fetches HTML and extracts textual content
-func fetchPageText(url string) string {
-	resp, err := http.Get(url)
-	if err != nil || resp.StatusCode != http.StatusOK {
+func searchDuckDuckGo(query string, httpClient *http.Client) []string {
+	u := "https://duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	resp, err := httpClient.Get(u)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		return nil
+	}
+	var links []string
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, a := range n.Attr {
+				if a.Key == "href" {
+					links = append(links, a.Val)
+					break
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+	if len(links) > 10 {
+		return links[:10]
+	}
+	return links
+}
+
+func fetchPageText(u string, httpClient *http.Client) string {
+	resp, err := httpClient.Get(u)
+	if err != nil || resp.StatusCode != 200 {
 		return ""
 	}
 	defer resp.Body.Close()
-
-	// Parse HTML
 	doc, err := html.Parse(resp.Body)
 	if err != nil {
 		return ""
